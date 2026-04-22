@@ -623,15 +623,16 @@ class HookedTransformer(HookedRootModule):
             # Eg: start_at_layer==3 + stop_at_layer==-1 means to run from layer 3 until the end of the PENULTIMATE layer
             # Pre-compute PLE vectors for all layers (Gemma 4)
             ple_vecs = None
-            if (
-                getattr(self.cfg, "use_ple", False)
-                and hasattr(self, "ple")
-                and start_at_layer == 0
-                and tokens is not None
-            ):
-                ple_vecs = self.ple(tokens, residual)  # [batch, pos, n_layers, d_ple]
+            if getattr(self.cfg, "use_ple", False) and hasattr(self, "ple"):
+                if start_at_layer == 0 and tokens is not None:
+                    ple_vecs = self.ple(tokens, residual)  # [batch, pos, n_layers, d_ple]
+                else:
+                    logging.warning(
+                        "PLE skipped: start_at_layer > 0 or tokens unavailable. "
+                        "PLE requires a full forward pass from the embedding layer."
+                    )
 
-            # Shared KV: determine source layers and prepare capture infrastructure
+            # Shared KV: determine source layers
             kv_shared: Optional[dict] = getattr(self.cfg, "kv_shared_layer_sources", None)
             source_layer_set: set = set(kv_shared.values()) if kv_shared else set()
             kv_store: dict = {}
@@ -650,20 +651,16 @@ class HookedTransformer(HookedRootModule):
                 # PLE vector for this layer (slice from pre-computed tensor)
                 ple_vec_i = ple_vecs[:, :, i, :] if ple_vecs is not None else None
 
+                # Shared KV: save residual_pre BEFORE running source blocks so we can
+                # re-compute post-norm K/V for sharing. We cannot use hook_k/hook_v because
+                # they fire before k_norm/v_norm are applied (Crucible finding, 2026-04-22).
+                residual_pre_i = residual if i in source_layer_set else None
+
                 # Shared KV: look up cached K/V if this is a consumer layer
                 cached_kv = None
                 if kv_shared and i in kv_shared:
                     src = kv_shared[i]
                     cached_kv = kv_store.get(src)
-
-                # Shared KV: register capture hooks if this layer is a KV source
-                _kv_buf: list = [None, None]
-                _hooks: list = []
-                if i in source_layer_set:
-                    def _k_hook(m, inp, out, buf=_kv_buf): buf[0] = out
-                    def _v_hook(m, inp, out, buf=_kv_buf): buf[1] = out
-                    _hooks.append(block.attn.hook_k.register_forward_hook(_k_hook))
-                    _hooks.append(block.attn.hook_v.register_forward_hook(_v_hook))
 
                 residual = block(
                     residual,
@@ -676,11 +673,12 @@ class HookedTransformer(HookedRootModule):
                     cached_kv=cached_kv,
                 )  # [batch, pos, d_model]
 
-                # Collect captured K/V and remove hooks
-                for h in _hooks:
-                    h.remove()
-                if i in source_layer_set and _kv_buf[0] is not None:
-                    kv_store[i] = (_kv_buf[0], _kv_buf[1])
+                # Shared KV: compute post-norm K/V from source block for downstream sharing.
+                # Uses compute_kv_for_sharing (ln1 + K/V proj + k_norm + v_norm) rather than
+                # hooks, which would capture pre-norm tensors.
+                if i in source_layer_set and residual_pre_i is not None:
+                    if hasattr(block, "compute_kv_for_sharing"):
+                        kv_store[i] = block.compute_kv_for_sharing(residual_pre_i)
 
             if stop_at_layer is not None:
                 # When we stop at an early layer, we end here rather than doing further computation

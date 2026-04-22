@@ -69,7 +69,9 @@ class PLEPrecomputer(nn.Module):
         token_embeds = self.hook_token_embeds(token_embeds)
 
         # Context component: project hidden states, scale, norm
-        # Scale by 1/sqrt(d_model) as in HF source (proj_scale)
+        # proj_scale is applied before RMSNorm, which normalises to unit RMS regardless,
+        # so the scale is absorbed. We keep it to mirror the HF ordering exactly — W_proj
+        # weights were trained with this in the computation graph.
         proj_scale = self.cfg.d_model ** -0.5
         context_flat = (inputs_embeds @ self.W_proj) * proj_scale  # [B, L, n_layers * d_ple]
         context = context_flat.reshape(B * L * n_layers, d_ple)

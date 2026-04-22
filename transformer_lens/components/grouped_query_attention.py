@@ -1,8 +1,9 @@
-from typing import Dict, Tuple, Union
+from typing import Dict, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 from jaxtyping import Float
+from torch import Tensor
 
 from transformer_lens.components import AbstractAttention
 from transformer_lens.components.rms_norm import RMSNorm
@@ -204,3 +205,23 @@ class GroupedQueryAttention(AbstractAttention):
         x_reshaped = x.reshape(-1, d_head)
         x_normed = norm_module(x_reshaped)
         return x_normed.reshape(batch, pos, n_heads, d_head)
+
+    def compute_kv_post_norm(self, key_value_input: Tensor) -> Tuple[Tensor, Tensor]:
+        """Compute K and V with norms applied, without running full attention.
+
+        Used by HookedTransformer to capture correct post-norm K/V from KV source layers for
+        sharing with downstream layers. Avoids hook_k/hook_v which fire before norm application.
+        """
+        attn_fn = (
+            complex_attn_linear
+            if self.cfg.use_split_qkv_input or self.cfg.use_attn_in
+            else simple_attn_linear
+        )
+        k = attn_fn(key_value_input, self._W_K, self._b_K)
+        v = attn_fn(key_value_input, self._W_V, self._b_V)
+        if self.cfg.use_qk_norm:
+            assert self.k_norm is not None
+            k = self._apply_qk_norm(k, self.k_norm)
+            if self.v_norm is not None:
+                v = self._apply_qk_norm(v, self.v_norm)
+        return k, v

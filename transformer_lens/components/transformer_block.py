@@ -121,7 +121,9 @@ class TransformerBlock(nn.Module):
             self.ple_gate = _PLELinear(self.cfg.d_model, self.cfg.d_ple, self.cfg.dtype)
             self.ple_up = _PLELinear(self.cfg.d_ple, self.cfg.d_model, self.cfg.dtype)
             self.ple_ln = normalization_layer(self.cfg)
-            # Per-layer learned scale (loaded from HF layer_scalar; initialized to 1)
+            # Per-layer learned scale (loaded from HF layer_scalar; initialized to 1).
+            # requires_grad=False: this weight is fixed at inference time in mechinterp use.
+            # Shape is 0-dim scalar — assumed from Kaggle enumeration; verify if load fails.
             self.layer_scale = nn.Parameter(
                 torch.tensor(1.0, dtype=self.cfg.dtype), requires_grad=False
             )
@@ -262,6 +264,17 @@ class TransformerBlock(nn.Module):
         if self.cfg.use_normalization_before_and_after:
             mlp_out = self.ln2_post(mlp_out)
         return self.hook_mlp_out(mlp_out)
+
+    def compute_kv_for_sharing(
+        self, residual_pre: Float[torch.Tensor, "batch pos d_model"]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return post-norm K/V from this block's residual for downstream shared-KV layers.
+
+        Applies ln1 then calls attn.compute_kv_post_norm so norms (k_norm, v_norm) are included.
+        Called by HookedTransformer instead of hook_k/hook_v capture, which fire pre-norm.
+        """
+        normed = self.ln1(residual_pre)
+        return self.attn.compute_kv_post_norm(normed)  # type: ignore[attr-defined]
 
     def _apply_ple(
         self,
