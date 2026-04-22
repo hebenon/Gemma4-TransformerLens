@@ -36,7 +36,7 @@ class GroupedQueryAttention(AbstractAttention):
             torch.empty(
                 cfg.n_key_value_heads,
                 self.cfg.d_model,
-                self.cfg.d_head,
+                self.d_head,
                 dtype=cfg.dtype,
             )
         )
@@ -44,15 +44,15 @@ class GroupedQueryAttention(AbstractAttention):
             torch.empty(
                 cfg.n_key_value_heads,
                 self.cfg.d_model,
-                self.cfg.d_head,
+                self.d_head,
                 dtype=cfg.dtype,
             )
         )
         self._b_K = nn.Parameter(
-            torch.zeros(cfg.n_key_value_heads, self.cfg.d_head, dtype=cfg.dtype)
+            torch.zeros(cfg.n_key_value_heads, self.d_head, dtype=cfg.dtype)
         )
         self._b_V = nn.Parameter(
-            torch.zeros(cfg.n_key_value_heads, self.cfg.d_head, dtype=cfg.dtype)
+            torch.zeros(cfg.n_key_value_heads, self.d_head, dtype=cfg.dtype)
         )
 
     @property
@@ -144,6 +144,8 @@ class GroupedQueryAttention(AbstractAttention):
             assert self.k_norm is not None
             q = self._apply_qk_norm(q, self.q_norm)
             k = self._apply_qk_norm(k, self.k_norm)
+            if self.v_norm is not None:
+                v = self._apply_qk_norm(v, self.v_norm)
 
         return q, k, v
 

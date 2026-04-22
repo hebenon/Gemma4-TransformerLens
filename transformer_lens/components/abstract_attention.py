@@ -30,6 +30,7 @@ class AbstractAttention(ABC, nn.Module):
     alibi: Union[torch.Tensor, None]
     q_norm: Optional[RMSNorm]
     k_norm: Optional[RMSNorm]
+    v_norm: Optional[RMSNorm]
     mask: torch.Tensor
     IGNORE: torch.Tensor
     rotary_sin: torch.Tensor
@@ -55,8 +56,15 @@ class AbstractAttention(ABC, nn.Module):
         super().__init__()
         self.cfg = HookedTransformerConfig.unwrap(cfg)
 
+        # Per-instance head dimension — Gemma 4 global layers use d_head_global (512) vs local (256)
+        self.d_head: int = (
+            self.cfg.d_head_global
+            if (attn_type == "global" and getattr(self.cfg, "d_head_global", None) is not None)
+            else self.cfg.d_head
+        )
+
         if self.cfg.load_in_4bit:
-            nq = int((self.cfg.d_model * self.cfg.d_head * self.cfg.n_heads) / 2)
+            nq = int((self.cfg.d_model * self.d_head * self.cfg.n_heads) / 2)
             self.W_Q: Union[nn.Parameter, "Params4bit"] = Params4bit(
                 torch.empty(nq, 1, dtype=torch.uint8), requires_grad=False
             )
@@ -68,14 +76,14 @@ class AbstractAttention(ABC, nn.Module):
                 torch.empty(
                     self.cfg.n_heads,
                     self.cfg.d_model,
-                    self.cfg.d_head,
+                    self.d_head,
                     dtype=self.cfg.dtype,
                 )
             )
             self.W_O = nn.Parameter(
                 torch.empty(
                     self.cfg.n_heads,
-                    self.cfg.d_head,
+                    self.d_head,
                     self.cfg.d_model,
                     dtype=self.cfg.dtype,
                 )
@@ -84,15 +92,15 @@ class AbstractAttention(ABC, nn.Module):
         self.W_V = abstract_attribute()
 
         self.b_Q = nn.Parameter(
-            torch.zeros(self.cfg.n_heads, self.cfg.d_head, dtype=self.cfg.dtype)
+            torch.zeros(self.cfg.n_heads, self.d_head, dtype=self.cfg.dtype)
         )
         self.b_K: nn.Parameter = abstract_attribute()
         self.b_V: nn.Parameter = abstract_attribute()
         self.b_O = nn.Parameter(torch.zeros(self.cfg.d_model, dtype=self.cfg.dtype))
 
         if self.cfg.use_qk_norm:
-            self.q_norm = RMSNorm(self.cfg, length=self.cfg.d_head)
-            self.k_norm = RMSNorm(self.cfg, length=self.cfg.d_head)
+            self.q_norm = RMSNorm(self.cfg, length=self.d_head)
+            self.k_norm = RMSNorm(self.cfg, length=self.d_head)
 
         elif self.cfg.original_architecture in (
             "OlmoeForCausalLM",
@@ -113,6 +121,13 @@ class AbstractAttention(ABC, nn.Module):
         else:
             self.q_norm = None
             self.k_norm = None
+
+        # v_norm: Gemma 4 adds RMSNorm on V vectors alongside Q/K norms
+        self.v_norm = (
+            RMSNorm(self.cfg, length=self.d_head)
+            if (self.cfg.use_qk_norm and self.cfg.original_architecture == "Gemma4ForConditionalGeneration")
+            else None
+        )
 
         self.attn_type = attn_type
         # Create a max_ctx x max_ctx mask, with True iff that query position
@@ -135,7 +150,7 @@ class AbstractAttention(ABC, nn.Module):
 
         # attn_scale is a constant that we divide the attention scores by pre-softmax. I'm not entirely sure why it matters, but it's probably a mix of softmax not being scale invariant and numerical stability?
         if self.cfg.use_attn_scale:
-            self.attn_scale = self.cfg.attn_scale  # Defaults to sqrt(d_head)
+            self.attn_scale = math.sqrt(self.d_head)  # Per-instance: global layers use d_head_global
         else:
             self.attn_scale = 1.0
         if self.cfg.scale_attn_by_inverse_layer_idx:
@@ -161,13 +176,19 @@ class AbstractAttention(ABC, nn.Module):
             self.hook_rot_q = HookPoint()
             if self.cfg.rotary_dim is None:  # keep mypy happy
                 raise ValueError("Rotary dim must be provided for rotary positional embeddings")
-            # Use per-layer RoPE base if specified (e.g., Gemma 3 uses 10k for local, 1M for global)
-            if self.cfg.rotary_base_local is not None and self.attn_type == "local":
+            # Use per-layer RoPE base if specified (e.g., Gemma 3/4 uses 10k for local, 1M for global)
+            if self.cfg.rotary_base_local is not None and attn_type == "local":
                 rope_base = self.cfg.rotary_base_local
             else:
                 rope_base = self.cfg.rotary_base
+            # For Gemma 4 global layers, use rotary_dim_global (128) instead of cfg.rotary_dim (256)
+            _rotary_dim = (
+                self.cfg.rotary_dim_global
+                if (attn_type == "global" and getattr(self.cfg, "rotary_dim_global", None) is not None)
+                else self.cfg.rotary_dim
+            )
             sin, cos = self.calculate_sin_cos_rotary(
-                self.cfg.rotary_dim,
+                _rotary_dim,
                 self.cfg.n_ctx,
                 base=rope_base,
                 dtype=self.cfg.dtype,
@@ -228,6 +249,7 @@ class AbstractAttention(ABC, nn.Module):
         additive_attention_mask: Optional[Float[torch.Tensor, "batch 1 1 kv_pos"]] = None,
         attention_mask: Optional[Int[torch.Tensor, "batch offset_pos"]] = None,
         position_bias: Optional[Float[torch.Tensor, "1 head_index pos kv_pos"]] = None,
+        cached_kv: Optional[Tuple[Tensor, Tensor]] = None,
     ) -> Float[torch.Tensor, "batch pos d_model"]:
         """
         shortformer_pos_embed is only used if self.cfg.positional_embedding_type == "shortformer", else defaults to None and is irrelevant. See HookedTransformerConfig for more details
@@ -237,6 +259,10 @@ class AbstractAttention(ABC, nn.Module):
         """
 
         q, k, v = self.calculate_qkv_matrices(query_input, key_input, value_input)
+
+        # Shared KV: override K/V with pre-computed values from the source layer
+        if cached_kv is not None:
+            k, v = cached_kv
 
         # OLMo-family QK-norm: applied on full projected vectors before head reshape.
         if self.cfg.original_architecture in (
@@ -340,7 +366,7 @@ class AbstractAttention(ABC, nn.Module):
                 W_O_4bit = cast(Params4bit, self.W_O)
                 out = (
                     bnb.matmul_4bit(
-                        z.reshape(z.shape[0], z.shape[1], self.cfg.d_head * self.cfg.n_heads),
+                        z.reshape(z.shape[0], z.shape[1], self.d_head * self.cfg.n_heads),
                         W_O_4bit.t(),
                         bias=None,
                         quant_state=W_O_4bit.quant_state,
@@ -363,7 +389,7 @@ class AbstractAttention(ABC, nn.Module):
                 if z.dtype != w.dtype:
                     z = z.to(w.dtype)
 
-                z = z.reshape(z.shape[0], z.shape[1], self.cfg.d_head * self.cfg.n_heads)
+                z = z.reshape(z.shape[0], z.shape[1], self.d_head * self.cfg.n_heads)
 
                 # F.linear is a fused matmul+bias that matches HuggingFace exactly,
                 # but has a bug on MPS with PyTorch 2.8 (pytorch#161640).
@@ -379,7 +405,7 @@ class AbstractAttention(ABC, nn.Module):
                 W_O_4bit = cast(Params4bit, self.W_O)
                 result = self.hook_result(
                     bnb.matmul_4bit(
-                        z.reshape(z.shape[0], z.shape[1], self.cfg.d_head * self.cfg.n_heads),
+                        z.reshape(z.shape[0], z.shape[1], self.d_head * self.cfg.n_heads),
                         W_O_4bit.t(),
                         bias=None,
                         quant_state=W_O_4bit.quant_state,
@@ -464,7 +490,7 @@ class AbstractAttention(ABC, nn.Module):
                     query_input.shape[0],
                     query_input.shape[1],
                     self.cfg.n_heads,
-                    self.cfg.d_head,
+                    self.d_head,
                 )
                 + self.b_Q
             )
@@ -481,7 +507,7 @@ class AbstractAttention(ABC, nn.Module):
                     key_input.shape[0],
                     key_input.shape[1],
                     self.cfg.n_heads,
-                    self.cfg.d_head,
+                    self.d_head,
                 )
                 + self.b_K
             )
@@ -502,7 +528,7 @@ class AbstractAttention(ABC, nn.Module):
                     value_input.shape[0],
                     value_input.shape[1],
                     self.cfg.n_heads,
-                    self.cfg.d_head,
+                    self.d_head,
                 )
                 + self.b_V
             )
@@ -514,6 +540,8 @@ class AbstractAttention(ABC, nn.Module):
             assert self.k_norm is not None
             q = self._apply_qk_norm(q, self.q_norm)
             k = self._apply_qk_norm(k, self.k_norm)
+            if self.v_norm is not None:
+                v = self._apply_qk_norm(v, self.v_norm)
 
         return q, k, v
 
@@ -723,8 +751,14 @@ class AbstractAttention(ABC, nn.Module):
             x = x.to(cast(torch.device, self.rotary_sin.device))
 
         x_pos = x.size(1)
-        x_rot = x[..., : self.cfg.rotary_dim]
-        x_pass = x[..., self.cfg.rotary_dim :]
+        # Gemma 4 global layers use rotary_dim_global (128) while local layers use cfg.rotary_dim (256)
+        rotary_dim = (
+            self.cfg.rotary_dim_global
+            if (self.attn_type == "global" and getattr(self.cfg, "rotary_dim_global", None) is not None)
+            else self.cfg.rotary_dim
+        )
+        x_rot = x[..., :rotary_dim]
+        x_pass = x[..., rotary_dim:]
         x_flip = self.rotate_every_two(x_rot)
 
         # Dynamically extend rotary embeddings if needed for long context
@@ -751,21 +785,21 @@ class AbstractAttention(ABC, nn.Module):
 
     def _extend_rotary_embeddings(self, new_size: int):
         """Extend rotary embeddings to support longer contexts dynamically."""
-        # Get the RoPE base from config or use default
-        rope_base = getattr(self.cfg, "rotary_base", 10000)
+        # Use per-attn_type RoPE base (matches __init__ logic)
+        if self.cfg.rotary_base_local is not None and self.attn_type == "local":
+            rope_base = self.cfg.rotary_base_local
+        else:
+            rope_base = getattr(self.cfg, "rotary_base", 10000)
 
-        # Ensure rotary_dim is set
-        assert self.cfg.rotary_dim is not None, "rotary_dim must be set for rotary embeddings"
-
-        # Calculate new embeddings
-        sin, cos = self.calculate_sin_cos_rotary(
-            self.cfg.rotary_dim,
-            new_size,
-            base=rope_base,
-            dtype=self.cfg.dtype,
+        # Use per-attn_type rotary dim (Gemma 4 global layers use rotary_dim_global)
+        rotary_dim = (
+            self.cfg.rotary_dim_global
+            if (self.attn_type == "global" and getattr(self.cfg, "rotary_dim_global", None) is not None)
+            else self.cfg.rotary_dim
         )
+        assert rotary_dim is not None, "rotary_dim must be set for rotary embeddings"
 
-        # Update the registered buffers
+        sin, cos = self.calculate_sin_cos_rotary(rotary_dim, new_size, base=rope_base, dtype=self.cfg.dtype)
         self.rotary_sin = sin.to(self.rotary_sin.device)
         self.rotary_cos = cos.to(self.rotary_cos.device)
 

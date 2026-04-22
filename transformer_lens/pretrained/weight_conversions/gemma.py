@@ -198,21 +198,25 @@ def convert_gemma4_weights(gemma, cfg: HookedTransformerConfig):
         # einops infers h = total_dim / n_heads, so global layers (W_Q=[4096,1536]) correctly
         # produce [8, 1536, 512] without needing to specify h explicitly.
         W_Q = einops.rearrange(layer.self_attn.q_proj.weight, "(n h) m -> n m h", n=cfg.n_heads)
-        W_K = einops.rearrange(layer.self_attn.k_proj.weight, "(n h) m -> n m h", n=cfg.n_key_value_heads)
-        W_V = einops.rearrange(layer.self_attn.v_proj.weight, "(n h) m -> n m h", n=cfg.n_key_value_heads)
         W_O = einops.rearrange(layer.self_attn.o_proj.weight, "m (n h) -> n h m", n=cfg.n_heads)
 
         state_dict[f"blocks.{l}.attn.W_Q"] = W_Q
-        state_dict[f"blocks.{l}.attn._W_K"] = W_K
-        state_dict[f"blocks.{l}.attn._W_V"] = W_V
         state_dict[f"blocks.{l}.attn.W_O"] = W_O
 
         # Bias shapes must use per-layer d_head (global layers: 512, local: 256)
         dev = W_Q.device
         state_dict[f"blocks.{l}.attn.b_Q"] = torch.zeros(cfg.n_heads, d_head_l, dtype=cfg.dtype, device=dev)
-        state_dict[f"blocks.{l}.attn._b_K"] = torch.zeros(cfg.n_key_value_heads, d_head_l, dtype=cfg.dtype, device=dev)
-        state_dict[f"blocks.{l}.attn._b_V"] = torch.zeros(cfg.n_key_value_heads, d_head_l, dtype=cfg.dtype, device=dev)
         state_dict[f"blocks.{l}.attn.b_O"] = torch.zeros(cfg.d_model, dtype=cfg.dtype, device=dev)
+
+        # Shared KV layers (15–34) may not have k_proj/v_proj in the HF model
+        is_shared_kv = cfg.kv_shared_layer_sources is not None and l in cfg.kv_shared_layer_sources
+        if not is_shared_kv:
+            W_K = einops.rearrange(layer.self_attn.k_proj.weight, "(n h) m -> n m h", n=cfg.n_key_value_heads)
+            W_V = einops.rearrange(layer.self_attn.v_proj.weight, "(n h) m -> n m h", n=cfg.n_key_value_heads)
+            state_dict[f"blocks.{l}.attn._W_K"] = W_K
+            state_dict[f"blocks.{l}.attn._W_V"] = W_V
+            state_dict[f"blocks.{l}.attn._b_K"] = torch.zeros(cfg.n_key_value_heads, d_head_l, dtype=cfg.dtype, device=dev)
+            state_dict[f"blocks.{l}.attn._b_V"] = torch.zeros(cfg.n_key_value_heads, d_head_l, dtype=cfg.dtype, device=dev)
 
         # Q/K/V norms (Gemma 4 adds v_norm alongside q_norm and k_norm)
         if cfg.use_qk_norm:
