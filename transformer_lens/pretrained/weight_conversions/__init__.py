@@ -1,7 +1,7 @@
 from .bert import convert_bert_weights
 from .bloom import convert_bloom_weights
 from .coder import convert_coder_weights
-from .gemma import convert_gemma_weights
+from .gemma import convert_gemma_weights, convert_gemma4_weights
 from .gpt2 import convert_gpt2_weights
 from .gptj import convert_gptj_weights
 from .llama import convert_llama_weights

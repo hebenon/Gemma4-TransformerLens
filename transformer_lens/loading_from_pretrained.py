@@ -32,6 +32,7 @@ from transformer_lens.pretrained.weight_conversions import (
     convert_bloom_weights,
     convert_coder_weights,
     convert_gemma_weights,
+    convert_gemma4_weights,
     convert_gpt2_weights,
     convert_gpt_oss_weights,
     convert_gptj_weights,
@@ -2188,6 +2189,8 @@ def get_pretrained_state_dict(
             state_dict = convert_gemma_weights(hf_model, cfg)
         elif cfg.original_architecture == "Gemma3ForConditionalGeneration":
             state_dict = convert_gemma_weights(hf_model, cfg)
+        elif cfg.original_architecture == "Gemma4ForConditionalGeneration":
+            state_dict = convert_gemma4_weights(hf_model, cfg)
         elif cfg.original_architecture == "OlmoForCausalLM":
             state_dict = convert_olmo_weights(hf_model, cfg)
         elif cfg.original_architecture == "Olmo2ForCausalLM":
