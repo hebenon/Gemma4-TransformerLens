@@ -140,6 +140,9 @@ def convert_hf_model_config(model_name: str, **kwargs: Any) -> dict[str, Any]:
     # Load HuggingFace model config
     if "llama" in official_model_name.lower():
         architecture = "LlamaForCausalLM"
+    elif "gemma-4" in official_model_name.lower():
+        # Gemma 4: all variants use the multimodal class (text extracted via language_model)
+        architecture = "Gemma4ForConditionalGeneration"
     elif "gemma-3" in official_model_name.lower() or "medgemma" in official_model_name.lower():
         # Gemma 3: 270M and 1B are text-only (CausalLM), 4B+ are multimodal (ConditionalGeneration)
         # Exception: medgemma-27b-text-it is text-only
@@ -1368,6 +1371,52 @@ def convert_hf_model_config(model_name: str, **kwargs: Any) -> dict[str, Any]:
                 "local",
                 "local",
             ],
+        }
+    elif official_model_name.startswith("google/gemma-4-E2B"):
+        # Gemma 4 E2B (2.3B effective / 5.1B total with embeddings)
+        # Architecture confirmed from config.json enumeration 2026-04-22
+        # Multimodal class; text extracted via model.model.language_model
+        cfg_dict = {
+            "d_model": 1536,
+            "d_head": 256,          # Local (sliding) attention head dim
+            "n_heads": 8,
+            "d_mlp": 6144,
+            "n_layers": 35,
+            "n_ctx": 131072,        # 128K context
+            "eps": 1e-06,
+            "d_vocab": 262144,
+            "act_fn": "gelu_pytorch_tanh",
+            "normalization_type": "RMS",
+            "positional_embedding_type": "rotary",
+            "rotary_base": 1000000,       # Global (full) attention layers
+            "rotary_base_local": 10000,   # Local (sliding) attention layers
+            "use_attn_scale": True,
+            "n_key_value_heads": 1,
+            "gated_mlp": True,
+            "final_rms": True,
+            "use_normalization_before_and_after": True,
+            "use_qk_norm": True,
+            "window_size": 512,
+            "use_local_attn": True,
+            "attn_types": [
+                # 4:1 sliding:full pattern, 7 repetitions of [local×4, global×1]
+                "local", "local", "local", "local", "global",  # 0-4
+                "local", "local", "local", "local", "global",  # 5-9
+                "local", "local", "local", "local", "global",  # 10-14
+                "local", "local", "local", "local", "global",  # 15-19
+                "local", "local", "local", "local", "global",  # 20-24
+                "local", "local", "local", "local", "global",  # 25-29
+                "local", "local", "local", "local", "global",  # 30-34
+            ],
+            "output_logits_soft_cap": 30.0,
+            # Gemma 4 extensions
+            "d_head_global": 512,               # Global attention uses larger head dim
+            "partial_rotary_factor_global": 0.25,  # Global: only 128/512 dims get RoPE
+            "num_kv_shared_layers": 20,         # Last 20 layers share K/V from layers 13/14
+            "use_ple": True,                    # Per-Layer Embeddings
+            "d_ple": 256,
+            "ple_vocab_size": 262144,
+            "tokenizer_name": "google/gemma-4-E2B-it",
         }
     elif official_model_name.startswith("google/gemma-2b"):
         # Architecture for Gemma 2b and Gemma 2b Instruct models

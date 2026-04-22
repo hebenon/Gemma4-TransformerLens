@@ -211,6 +211,29 @@ class HookedTransformerConfig(TransformerLensConfig):
             which use different RoPE bases for local (10k) and global (1M) attention. Defaults
             to None, which means the standard rotary_base is used for all layers.
         norm_topk_prob (bool): Whether to normalize the top-k probabilities in the MoE layer.
+        d_head_global (int, *optional*): The head dimension for global (full) attention layers in
+            models that use two different head sizes (e.g., Gemma 4 uses d_head=256 for local
+            sliding attention and d_head_global=512 for global full attention). Defaults to None,
+            meaning all layers use d_head.
+        partial_rotary_factor_global (float, *optional*): The fraction of head dimensions that
+            receive rotary positional encoding in global attention layers. Gemma 4 uses 0.25 —
+            only 128 of 512 global head dims are rotated. Defaults to None (full rotary).
+        rotary_dim_global (int, *optional*): Automatically computed as
+            round(d_head_global * partial_rotary_factor_global) when both are set. Equivalent
+            to rotary_dim but for global attention layers. Defaults to None.
+        num_kv_shared_layers (int): Number of layers at the end of the model that reuse K/V
+            from an earlier source layer instead of computing their own. Used in Gemma 4, where
+            the last 20 of 35 layers share K/V. Defaults to 0 (no sharing).
+        kv_shared_layer_sources (Dict[int, int], *optional*): Automatically computed mapping
+            from borrowing layer index → source layer index, derived from num_kv_shared_layers
+            and attn_types. E.g. {15: 13, 16: 13, ..., 19: 14, ...} for Gemma 4 E2B.
+        use_ple (bool): Whether to use Per-Layer Embeddings — a gated bottleneck conditioning
+            pathway at every decoder layer that injects token-identity and context information.
+            New in Gemma 4. Defaults to False.
+        d_ple (int, *optional*): The dimension of the Per-Layer Embedding vectors (bottleneck
+            width). Gemma 4 E2B uses 256. Defaults to None.
+        ple_vocab_size (int, *optional*): The vocabulary size for the PLE token-identity
+            embedding table. Defaults to None (typically matches d_vocab).
     """
 
     model_name: str = "custom"
@@ -281,6 +304,17 @@ class HookedTransformerConfig(TransformerLensConfig):
     yarn_beta_slow: float = 1.0
     yarn_original_max_position_embeddings: int = 4096
     norm_topk_prob: bool = False
+    # Gemma 4: dual head dimensions
+    d_head_global: Optional[int] = None
+    partial_rotary_factor_global: Optional[float] = None
+    rotary_dim_global: Optional[int] = None
+    # Gemma 4: shared KV cache
+    num_kv_shared_layers: int = 0
+    kv_shared_layer_sources: Optional[Dict[int, int]] = None
+    # Gemma 4: Per-Layer Embeddings
+    use_ple: bool = False
+    d_ple: Optional[int] = None
+    ple_vocab_size: Optional[int] = None
 
     def __post_init__(self):
         # Call parent's post_init first
@@ -311,6 +345,24 @@ class HookedTransformerConfig(TransformerLensConfig):
 
         if self.positional_embedding_type == "rotary" and self.rotary_dim is None:
             self.rotary_dim = self.d_head
+
+        # Gemma 4: compute rotary_dim_global from d_head_global × partial_rotary_factor_global
+        if self.d_head_global is not None and self.rotary_dim_global is None:
+            factor = self.partial_rotary_factor_global if self.partial_rotary_factor_global is not None else 1.0
+            self.rotary_dim_global = round(self.d_head_global * factor)
+
+        # Gemma 4: compute kv_shared_layer_sources from num_kv_shared_layers + attn_types
+        if self.num_kv_shared_layers > 0 and self.kv_shared_layer_sources is None:
+            assert self.attn_types is not None, "attn_types required when num_kv_shared_layers > 0"
+            first_shared = self.n_layers - self.num_kv_shared_layers
+            # Find the last source layer of each attention type (layers before first_shared)
+            last_source: Dict[str, int] = {}
+            for i in range(first_shared):
+                last_source[self.attn_types[i]] = i
+            self.kv_shared_layer_sources = {
+                i: last_source[self.attn_types[i]]
+                for i in range(first_shared, self.n_layers)
+            }
 
         if self.num_experts is not None:
             assert (

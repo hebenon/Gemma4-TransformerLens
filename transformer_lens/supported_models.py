@@ -93,6 +93,7 @@ OFFICIAL_MODEL_NAMES: list[str] = [
     "google/gemma-2-9b-it",
     "google/gemma-2b",
     "google/gemma-2b-it",
+    "google/gemma-4-E2B-it",
     "google/gemma-3-12b-it",
     "google/gemma-3-12b-pt",
     "google/gemma-3-1b-it",
