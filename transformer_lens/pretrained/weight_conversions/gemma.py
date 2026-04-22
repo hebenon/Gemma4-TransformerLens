@@ -1,5 +1,3 @@
-import math
-
 import einops
 import torch
 
@@ -172,7 +170,9 @@ def convert_gemma4_weights(gemma, cfg: HookedTransformerConfig):
     state_dict = {}
 
     # Embeddings: scaled by sqrt(d_model), same as Gemma 3
-    state_dict["embed.W_E"] = base_model.embed_tokens.weight * math.sqrt(cfg.d_model)
+    state_dict["embed.W_E"] = base_model.embed_tokens.weight * torch.tensor(
+        cfg.d_model**0.5, dtype=cfg.dtype
+    )
 
     # PLE model-level weights
     if cfg.use_ple:

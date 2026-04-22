@@ -359,6 +359,13 @@ class HookedTransformerConfig(TransformerLensConfig):
             last_source: Dict[str, int] = {}
             for i in range(first_shared):
                 last_source[self.attn_types[i]] = i
+            # Validate all shared layers have a matching source type
+            shared_types = set(self.attn_types[i] for i in range(first_shared, self.n_layers))
+            missing = shared_types - set(last_source)
+            assert not missing, (
+                f"Shared layers have attn_types {missing} not present in source layers [0, {first_shared}). "
+                f"Cannot determine KV source for these layers."
+            )
             self.kv_shared_layer_sources = {
                 i: last_source[self.attn_types[i]]
                 for i in range(first_shared, self.n_layers)
