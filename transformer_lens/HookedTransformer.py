@@ -50,6 +50,7 @@ from transformer_lens.components import (
     Embed,
     LayerNorm,
     LayerNormPre,
+    PLEPrecomputer,
     PosEmbed,
     RMSNorm,
     RMSNormPre,
@@ -205,6 +206,9 @@ class HookedTransformer(HookedRootModule):
         self.blocks = nn.ModuleList(
             [TransformerBlock(self.cfg, block_index) for block_index in range(self.cfg.n_layers)]
         )
+
+        if getattr(self.cfg, "use_ple", False):
+            self.ple = PLEPrecomputer(self.cfg)
 
         if self.cfg.normalization_type == "RMS":
             self.ln_final = RMSNorm(self.cfg)
@@ -617,6 +621,21 @@ class HookedTransformer(HookedRootModule):
             # exclusive.
             # Eg: start_at_layer==None + stop_at_layer==0 means to only run the embed.
             # Eg: start_at_layer==3 + stop_at_layer==-1 means to run from layer 3 until the end of the PENULTIMATE layer
+            # Pre-compute PLE vectors for all layers (Gemma 4)
+            ple_vecs = None
+            if (
+                getattr(self.cfg, "use_ple", False)
+                and hasattr(self, "ple")
+                and start_at_layer == 0
+                and tokens is not None
+            ):
+                ple_vecs = self.ple(tokens, residual)  # [batch, pos, n_layers, d_ple]
+
+            # Shared KV: determine source layers and prepare capture infrastructure
+            kv_shared: Optional[dict] = getattr(self.cfg, "kv_shared_layer_sources", None)
+            source_layer_set: set = set(kv_shared.values()) if kv_shared else set()
+            kv_store: dict = {}
+
             blocks_and_idxs = list(zip(range(self.cfg.n_layers), self.blocks))
             for i, block in blocks_and_idxs[start_at_layer:stop_at_layer]:  # type: ignore
                 # Note that each block includes skip connections, so we don't need
@@ -628,6 +647,24 @@ class HookedTransformer(HookedRootModule):
                         get_device_for_block_index(i, self.cfg)
                     )
 
+                # PLE vector for this layer (slice from pre-computed tensor)
+                ple_vec_i = ple_vecs[:, :, i, :] if ple_vecs is not None else None
+
+                # Shared KV: look up cached K/V if this is a consumer layer
+                cached_kv = None
+                if kv_shared and i in kv_shared:
+                    src = kv_shared[i]
+                    cached_kv = kv_store.get(src)
+
+                # Shared KV: register capture hooks if this layer is a KV source
+                _kv_buf: list = [None, None]
+                _hooks: list = []
+                if i in source_layer_set:
+                    def _k_hook(m, inp, out, buf=_kv_buf): buf[0] = out
+                    def _v_hook(m, inp, out, buf=_kv_buf): buf[1] = out
+                    _hooks.append(block.attn.hook_k.register_forward_hook(_k_hook))
+                    _hooks.append(block.attn.hook_v.register_forward_hook(_v_hook))
+
                 residual = block(
                     residual,
                     # Cache contains a list of TransformerLensKeyValueCache objects, one for each
@@ -635,7 +672,15 @@ class HookedTransformer(HookedRootModule):
                     past_kv_cache_entry=past_kv_cache[i] if past_kv_cache is not None else None,
                     shortformer_pos_embed=shortformer_pos_embed,
                     attention_mask=attention_mask,
+                    ple_vec=ple_vec_i,
+                    cached_kv=cached_kv,
                 )  # [batch, pos, d_model]
+
+                # Collect captured K/V and remove hooks
+                for h in _hooks:
+                    h.remove()
+                if i in source_layer_set and _kv_buf[0] is not None:
+                    kv_store[i] = (_kv_buf[0], _kv_buf[1])
 
             if stop_at_layer is not None:
                 # When we stop at an early layer, we end here rather than doing further computation

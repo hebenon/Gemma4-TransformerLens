@@ -24,6 +24,7 @@ from .embed import Embed
 from .grouped_query_attention import GroupedQueryAttention
 from .mlps.gated_mlp import GatedMLP
 from .mlps.mlp import MLP
+from .ple_precomputer import PLEPrecomputer
 
 # Interdependent modules
 from .bert_block import BertBlock

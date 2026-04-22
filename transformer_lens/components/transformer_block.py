@@ -3,11 +3,13 @@
 This module contains all the component :class:`TransformerBlock`.
 """
 
-from typing import Callable, Dict, Optional, Union
+from typing import Callable, Dict, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from jaxtyping import Float, Int
+from torch import Tensor
 
 from transformer_lens.cache.key_value_cache_entry import (
     TransformerLensKeyValueCacheEntry,
@@ -25,6 +27,17 @@ from transformer_lens.config.HookedTransformerConfig import HookedTransformerCon
 from transformer_lens.factories.mlp_factory import MLPFactory
 from transformer_lens.hook_points import HookPoint
 from transformer_lens.utilities import repeat_along_head_dimension
+
+
+class _PLELinear(nn.Module):
+    """Bias-free linear used for PLE gate and up-projection. Stores weight as W (TL convention)."""
+
+    def __init__(self, d_in: int, d_out: int, dtype: torch.dtype):
+        super().__init__()
+        self.W = nn.Parameter(torch.empty(d_in, d_out, dtype=dtype))
+
+    def forward(self, x: Tensor) -> Tensor:
+        return x @ self.W
 
 
 # Transformer Block
@@ -100,12 +113,27 @@ class TransformerBlock(nn.Module):
             self.hook_resid_mid = HookPoint()  # [batch, pos, d_model]
         self.hook_resid_post = HookPoint()  # [batch, pos, d_model]
 
+        if getattr(self.cfg, "use_ple", False):
+            assert self.cfg.d_ple is not None
+            self.hook_ple_input = HookPoint()   # [batch, pos, d_ple] — PLE conditioning vector
+            self.hook_ple_gate = HookPoint()    # [batch, pos, d_ple] — gate activations post-GELU
+            self.hook_ple_output = HookPoint()  # [batch, pos, d_model] — bottleneck output pre-residual
+            self.ple_gate = _PLELinear(self.cfg.d_model, self.cfg.d_ple, self.cfg.dtype)
+            self.ple_up = _PLELinear(self.cfg.d_ple, self.cfg.d_model, self.cfg.dtype)
+            self.ple_ln = normalization_layer(self.cfg)
+            # Per-layer learned scale (loaded from HF layer_scalar; initialized to 1)
+            self.layer_scale = nn.Parameter(
+                torch.tensor(1.0, dtype=self.cfg.dtype), requires_grad=False
+            )
+
     def forward(
         self,
         resid_pre: Float[torch.Tensor, "batch pos d_model"],
         shortformer_pos_embed: Optional[Float[torch.Tensor, "batch pos d_model"]] = None,
         past_kv_cache_entry: Optional[TransformerLensKeyValueCacheEntry] = None,
         attention_mask: Optional[Int[torch.Tensor, "batch offset_pos"]] = None,
+        ple_vec: Optional[Float[torch.Tensor, "batch pos d_ple"]] = None,
+        cached_kv: Optional[Tuple[Tensor, Tensor]] = None,
     ) -> Float[torch.Tensor, "batch pos d_model"]:
         """A single Transformer block.
 
@@ -162,6 +190,7 @@ class TransformerBlock(nn.Module):
                 value_input=value_input,
                 past_kv_cache_entry=past_kv_cache_entry,
                 attention_mask=attention_mask,
+                cached_kv=cached_kv,
             )
         else:
             attn_out = (
@@ -176,6 +205,7 @@ class TransformerBlock(nn.Module):
                     value_input=self.ln1(value_input),
                     past_kv_cache_entry=past_kv_cache_entry,
                     attention_mask=attention_mask,
+                    cached_kv=cached_kv,
                 )
             )  # [batch, pos, d_model]
         if self.cfg.use_normalization_before_and_after:
@@ -202,7 +232,10 @@ class TransformerBlock(nn.Module):
             else:
                 normalized_resid_mid = self.ln2(mlp_in)
                 mlp_out = self.apply_mlp(normalized_resid_mid)
-            resid_post = self.hook_resid_post(resid_mid + mlp_out)  # [batch, pos, d_model]
+            resid_combined = resid_mid + mlp_out
+            if getattr(self.cfg, "use_ple", False) and ple_vec is not None:
+                resid_combined = self._apply_ple(resid_combined, ple_vec)
+            resid_post = self.hook_resid_post(resid_combined)  # [batch, pos, d_model]
         elif self.cfg.parallel_attn_mlp:
             # Dumb thing done by GPT-J, both MLP and Attn read from resid_pre and write to resid_post, no resid_mid used.
             # In GPT-J, LN1 and LN2 are tied, in GPT-NeoX they aren't.
@@ -229,3 +262,21 @@ class TransformerBlock(nn.Module):
         if self.cfg.use_normalization_before_and_after:
             mlp_out = self.ln2_post(mlp_out)
         return self.hook_mlp_out(mlp_out)
+
+    def _apply_ple(
+        self,
+        resid: Float[torch.Tensor, "batch pos d_model"],
+        ple_vec: Float[torch.Tensor, "batch pos d_ple"],
+    ) -> Float[torch.Tensor, "batch pos d_model"]:
+        """Apply PLE gated bottleneck and layer_scale to residual stream.
+
+        Gate projects residual to d_ple, element-wise multiply with ple_vec (token+context
+        conditioning), project back to d_model via ple_up, add normed result to residual,
+        then scale by layer_scale.
+        """
+        ple_vec = self.hook_ple_input(ple_vec)
+        gate = self.hook_ple_gate(F.gelu(self.ple_gate(resid)))   # [B, L, d_ple]
+        ple_out = self.hook_ple_output(self.ple_up(gate * ple_vec))  # [B, L, d_model]
+        resid = resid + self.ple_ln(ple_out)
+        resid = resid * self.layer_scale
+        return resid
