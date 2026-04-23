@@ -143,8 +143,27 @@ def convert_gemma_weights(gemma, cfg: HookedTransformerConfig):
     return state_dict
 
 
-def _rms_weight(w: torch.Tensor) -> torch.Tensor:
-    """Gemma4RMSNorm adds 1 in forward() — pre-add here so TL can use raw multiply."""
+def _rms_weight(norm_or_tensor) -> torch.Tensor:
+    """Extract weight from a Gemma4RMSNorm (or tensor) and pre-add 1.
+
+    Gemma4RMSNorm adds 1 in forward() — bake that into the stored weight so TL
+    can use a plain multiply. Accepts either a raw tensor or a norm module,
+    auto-discovering the weight parameter name (varies across transformers versions).
+    """
+    if isinstance(norm_or_tensor, torch.Tensor):
+        w = norm_or_tensor
+    else:
+        for attr in ("weight", "w", "scale"):
+            candidate = getattr(norm_or_tensor, attr, None)
+            if isinstance(candidate, torch.Tensor):
+                w = candidate
+                break
+        else:
+            params = list(norm_or_tensor._parameters.keys())
+            raise AttributeError(
+                f"No weight param found on {type(norm_or_tensor).__name__} "
+                f"(tried weight/w/scale; actual params: {params})"
+            )
     return w.float() + torch.ones_like(w, dtype=torch.float32)
 
 
@@ -185,7 +204,7 @@ def convert_gemma4_weights(gemma, cfg: HookedTransformerConfig):
         state_dict["ple.W_embed"] = base_model.embed_tokens_per_layer.weight
         # Linear weight is [out=n_layers*d_ple, in=d_model]; transpose for TL [d_model, n_layers*d_ple]
         state_dict["ple.W_proj"] = base_model.per_layer_model_projection.weight.T
-        state_dict["ple.ln.w"] = _rms_weight(base_model.per_layer_projection_norm.weight)
+        state_dict["ple.ln.w"] = _rms_weight(base_model.per_layer_projection_norm)
         # Scale factors are fixed constants (confirmed 2026-04-22): proj_scale=1/sqrt(1536),
         # input_scale=1/sqrt(2). Baked into PLEPrecomputer.forward(), not stored here.
 
@@ -195,10 +214,10 @@ def convert_gemma4_weights(gemma, cfg: HookedTransformerConfig):
         d_head_l = cfg.d_head_global if (is_global and cfg.d_head_global) else cfg.d_head
 
         # Layer norms (pre- and post-sublayer, same as Gemma 3 use_normalization_before_and_after)
-        state_dict[f"blocks.{l}.ln1.w"] = _rms_weight(layer.input_layernorm.weight)
-        state_dict[f"blocks.{l}.ln1_post.w"] = _rms_weight(layer.post_attention_layernorm.weight)
-        state_dict[f"blocks.{l}.ln2.w"] = _rms_weight(layer.pre_feedforward_layernorm.weight)
-        state_dict[f"blocks.{l}.ln2_post.w"] = _rms_weight(layer.post_feedforward_layernorm.weight)
+        state_dict[f"blocks.{l}.ln1.w"] = _rms_weight(layer.input_layernorm)
+        state_dict[f"blocks.{l}.ln1_post.w"] = _rms_weight(layer.post_attention_layernorm)
+        state_dict[f"blocks.{l}.ln2.w"] = _rms_weight(layer.pre_feedforward_layernorm)
+        state_dict[f"blocks.{l}.ln2_post.w"] = _rms_weight(layer.post_feedforward_layernorm)
 
         # Attention weights
         # einops infers h = total_dim / n_heads, so global layers (W_Q=[4096,1536]) correctly
@@ -226,10 +245,10 @@ def convert_gemma4_weights(gemma, cfg: HookedTransformerConfig):
 
         # Q/K/V norms (Gemma 4 adds v_norm alongside q_norm and k_norm)
         if cfg.use_qk_norm:
-            state_dict[f"blocks.{l}.attn.q_norm.w"] = _rms_weight(layer.self_attn.q_norm.weight)
-            state_dict[f"blocks.{l}.attn.k_norm.w"] = _rms_weight(layer.self_attn.k_norm.weight)
+            state_dict[f"blocks.{l}.attn.q_norm.w"] = _rms_weight(layer.self_attn.q_norm)
+            state_dict[f"blocks.{l}.attn.k_norm.w"] = _rms_weight(layer.self_attn.k_norm)
             if hasattr(layer.self_attn, "v_norm"):
-                state_dict[f"blocks.{l}.attn.v_norm.w"] = _rms_weight(layer.self_attn.v_norm.weight)
+                state_dict[f"blocks.{l}.attn.v_norm.w"] = _rms_weight(layer.self_attn.v_norm)
 
         # MLP weights
         state_dict[f"blocks.{l}.mlp.W_in"] = layer.mlp.up_proj.weight.T
@@ -243,11 +262,11 @@ def convert_gemma4_weights(gemma, cfg: HookedTransformerConfig):
         if cfg.use_ple:
             state_dict[f"blocks.{l}.ple_gate.W"] = layer.per_layer_input_gate.weight.T
             state_dict[f"blocks.{l}.ple_up.W"] = layer.per_layer_projection.weight.T
-            state_dict[f"blocks.{l}.ple_ln.w"] = _rms_weight(layer.post_per_layer_input_norm.weight)
+            state_dict[f"blocks.{l}.ple_ln.w"] = _rms_weight(layer.post_per_layer_input_norm)
             # layer_scalar: plain torch.Tensor (not nn.Parameter) — copy as-is
             state_dict[f"blocks.{l}.layer_scale"] = layer.layer_scalar.clone()
 
-    state_dict["ln_final.w"] = _rms_weight(base_model.norm.weight)
+    state_dict["ln_final.w"] = _rms_weight(base_model.norm)
 
     # tie_word_embeddings=True for Gemma 4; lm_head exists on the outer wrapper
     if hasattr(gemma, "lm_head"):
