@@ -164,8 +164,14 @@ def convert_gemma4_weights(gemma, cfg: HookedTransformerConfig):
     assert cfg.n_key_value_heads is not None
     assert cfg.d_mlp is not None
 
-    # Gemma4ForConditionalGeneration: text model at model.language_model
-    base_model = gemma.model.language_model
+    # Handle both Gemma4ForConditionalGeneration (.model.language_model)
+    # and bare Gemma4Model (.language_model) returned by AutoModel.from_pretrained.
+    if hasattr(gemma, "model") and hasattr(gemma.model, "language_model"):
+        base_model = gemma.model.language_model
+    elif hasattr(gemma, "language_model"):
+        base_model = gemma.language_model
+    else:
+        raise ValueError(f"Cannot find language_model in {type(gemma).__name__}")
 
     state_dict = {}
 
