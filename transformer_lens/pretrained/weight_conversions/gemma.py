@@ -201,7 +201,11 @@ def convert_gemma4_weights(gemma, cfg: HookedTransformerConfig):
 
     # PLE model-level weights
     if cfg.use_ple:
-        state_dict["ple.W_embed"] = base_model.embed_tokens_per_layer.weight
+        # embed_tokens_per_layer is Gemma4TextScaledWordEmbedding — scale applied at forward,
+        # not in the weight tensor. Pre-multiply so TL's plain indexing gives correct output.
+        state_dict["ple.W_embed"] = base_model.embed_tokens_per_layer.weight * torch.tensor(
+            cfg.d_ple**0.5, dtype=cfg.dtype
+        )
         # Linear weight is [out=n_layers*d_ple, in=d_model]; transpose for TL [d_model, n_layers*d_ple]
         state_dict["ple.W_proj"] = base_model.per_layer_model_projection.weight.T
         state_dict["ple.ln.w"] = _rms_weight(base_model.per_layer_projection_norm)
@@ -243,10 +247,12 @@ def convert_gemma4_weights(gemma, cfg: HookedTransformerConfig):
             state_dict[f"blocks.{l}.attn._b_K"] = torch.zeros(cfg.n_key_value_heads, d_head_l, dtype=cfg.dtype, device=dev)
             state_dict[f"blocks.{l}.attn._b_V"] = torch.zeros(cfg.n_key_value_heads, d_head_l, dtype=cfg.dtype, device=dev)
 
-        # Q/K/V norms (Gemma 4 adds v_norm alongside q_norm and k_norm)
+        # Q/K/V norms. All layers have q_norm. Shared KV layers (15–34) don't have k_norm/v_norm
+        # in HF (see Gemma4TextAttention: only created if not is_kv_shared_layer).
         if cfg.use_qk_norm:
             state_dict[f"blocks.{l}.attn.q_norm.w"] = _rms_weight(layer.self_attn.q_norm)
-            state_dict[f"blocks.{l}.attn.k_norm.w"] = _rms_weight(layer.self_attn.k_norm)
+            if hasattr(layer.self_attn, "k_norm"):
+                state_dict[f"blocks.{l}.attn.k_norm.w"] = _rms_weight(layer.self_attn.k_norm)
             if hasattr(layer.self_attn, "v_norm") and len(list(layer.self_attn.v_norm.parameters())) > 0:
                 state_dict[f"blocks.{l}.attn.v_norm.w"] = _rms_weight(layer.self_attn.v_norm)
 
@@ -263,8 +269,8 @@ def convert_gemma4_weights(gemma, cfg: HookedTransformerConfig):
             state_dict[f"blocks.{l}.ple_gate.W"] = layer.per_layer_input_gate.weight.T
             state_dict[f"blocks.{l}.ple_up.W"] = layer.per_layer_projection.weight.T
             state_dict[f"blocks.{l}.ple_ln.w"] = _rms_weight(layer.post_per_layer_input_norm)
-            # layer_scalar: plain torch.Tensor (not nn.Parameter) — copy as-is
-            state_dict[f"blocks.{l}.layer_scale"] = layer.layer_scalar.clone()
+            # layer_scalar: HF registers as buffer shape [1]; TL param is 0-dim — squeeze.
+            state_dict[f"blocks.{l}.layer_scale"] = layer.layer_scalar.clone().squeeze()
 
     state_dict["ln_final.w"] = _rms_weight(base_model.norm)
 
