@@ -1,3 +1,7 @@
+import json
+from pathlib import Path
+from typing import Optional
+
 import einops
 import torch
 
@@ -282,5 +286,254 @@ def convert_gemma4_weights(gemma, cfg: HookedTransformerConfig):
         state_dict["unembed.W_U"] = base_model.embed_tokens.weight.T
         unembed_dev = base_model.embed_tokens.weight.device
     state_dict["unembed.b_U"] = torch.zeros(cfg.d_vocab, dtype=cfg.dtype, device=unembed_dev)
+
+    return state_dict
+
+
+# ── Streaming conversion ──────────────────────────────────────────────────────
+
+
+def _st_discover_prefix(weight_map: dict) -> str:
+    """Infer the base_model path prefix from the safetensors weight map.
+
+    Searches for 'embed_tokens.weight' (not the per_layer variant) to determine
+    how the module hierarchy is named in this particular checkpoint.
+    Returns the prefix including the trailing dot, e.g. 'model.language_model.model.'
+    """
+    for name in sorted(weight_map):
+        if name.endswith("embed_tokens.weight") and "per_layer" not in name:
+            return name[: -len("embed_tokens.weight")]
+    raise ValueError(
+        "Cannot determine prefix: no embed_tokens.weight in safetensors index.\n"
+        f"Sample keys: {list(weight_map)[:8]}"
+    )
+
+
+def _st_discover_lm_head(weight_map: dict, base_prefix: str) -> Optional[str]:
+    """Find the lm_head.weight tensor name in the safetensors index.
+
+    lm_head is on the outer model wrapper, one or two levels above base_model.
+    Tries several candidate paths; returns None if not found (use tied embeddings instead).
+    """
+    # Strip the trailing 'model.' from the base_prefix to find sibling paths
+    parts = base_prefix.rstrip(".").rsplit(".", 1)
+    parent = parts[0] if len(parts) > 1 else ""
+    candidates = [
+        f"{parent}.lm_head.weight" if parent else "lm_head.weight",
+        "language_model.lm_head.weight",
+        "model.lm_head.weight",
+        "lm_head.weight",
+    ]
+    for c in candidates:
+        if c in weight_map:
+            return c
+    return None
+
+
+def convert_gemma4_weights_from_disk(
+    model_dir: str,
+    cfg: HookedTransformerConfig,
+    dtype: Optional[torch.dtype] = None,
+) -> dict:
+    """Convert Gemma 4 weights to TransformerLens format by streaming from safetensors.
+
+    Unlike convert_gemma4_weights() which requires a fully-loaded AutoModel (~10 GB),
+    this function reads one tensor at a time from the raw safetensors checkpoint files.
+    Peak RAM is approximately one layer's worth of weights (~500 MB) rather than the
+    full model, making it suitable for memory-constrained environments (e.g. Kaggle T4).
+
+    Args:
+        model_dir: Path to the HF checkpoint directory containing *.safetensors files
+                   and model.safetensors.index.json.
+        cfg:       TL config for the model (from get_pretrained_model_config).
+        dtype:     Target dtype for weight tensors. Defaults to cfg.dtype.
+
+    Returns:
+        State dict ready for HookedTransformer.load_state_dict().
+    """
+    try:
+        from safetensors import safe_open
+    except ImportError:
+        raise ImportError(
+            "safetensors is required for streaming conversion. "
+            "Install with: pip install safetensors"
+        )
+
+    assert cfg.n_key_value_heads is not None
+    assert cfg.d_mlp is not None
+
+    if dtype is None:
+        dtype = cfg.dtype
+
+    model_dir = Path(model_dir)
+    index_path = model_dir / "model.safetensors.index.json"
+
+    if index_path.exists():
+        with open(index_path) as f:
+            weight_map: dict = json.load(f)["weight_map"]
+    else:
+        single = model_dir / "model.safetensors"
+        if not single.exists():
+            raise FileNotFoundError(
+                f"No safetensors files found in {model_dir}. "
+                "Expected model.safetensors.index.json or model.safetensors."
+            )
+        with safe_open(str(single), framework="pt", device="cpu") as f:
+            weight_map = {k: "model.safetensors" for k in f.keys()}
+
+    prefix = _st_discover_prefix(weight_map)
+    lm_head_key = _st_discover_lm_head(weight_map, prefix)
+
+    # Open shard file handles lazily; safetensors mmap's from disk — get_tensor() loads
+    # only the requested tensor's bytes, so handles can stay open without resident RAM.
+    _handles: dict = {}
+
+    def _open(shard: str):
+        if shard not in _handles:
+            _handles[shard] = safe_open(str(model_dir / shard), framework="pt", device="cpu")
+        return _handles[shard]
+
+    def get(name: str) -> torch.Tensor:
+        if name not in weight_map:
+            raise KeyError(f"Tensor {name!r} not in safetensors index")
+        return _open(weight_map[name]).get_tensor(name)
+
+    def get_opt(name: str) -> Optional[torch.Tensor]:
+        if name not in weight_map:
+            return None
+        return _open(weight_map[name]).get_tensor(name)
+
+    def rms(name: str) -> torch.Tensor:
+        """Load norm weight and pre-add 1 (Gemma4RMSNorm bakes +1 at forward time)."""
+        w = get(name).float()
+        return w + torch.ones_like(w)
+
+    def rms_opt(name: str) -> Optional[torch.Tensor]:
+        w = get_opt(name)
+        if w is None:
+            return None
+        w = w.float()
+        return w + torch.ones_like(w)
+
+    p = prefix  # e.g. "model.language_model.model." or "language_model.model."
+    state_dict: dict = {}
+
+    # Token embeddings: scaled by sqrt(d_model), same as Gemma 3
+    w = get(f"{p}embed_tokens.weight")
+    state_dict["embed.W_E"] = (w * (cfg.d_model ** 0.5)).to(dtype)
+    del w
+
+    # PLE model-level weights
+    if cfg.use_ple:
+        # Gemma4TextScaledWordEmbedding applies embed_scale at forward time, not in the weight
+        # tensor — pre-multiply so TL's plain indexing gives the correct output.
+        w = get(f"{p}embed_tokens_per_layer.weight")
+        state_dict["ple.W_embed"] = (w * (cfg.d_ple ** 0.5)).to(dtype)
+        del w
+
+        # HF stores as [out=n_layers*d_ple, in=d_model]; TL wants [d_model, n_layers*d_ple]
+        w = get(f"{p}per_layer_model_projection.weight")
+        state_dict["ple.W_proj"] = w.T.to(dtype)
+        del w
+
+        state_dict["ple.ln.w"] = rms(f"{p}per_layer_projection_norm.weight")
+
+    # Transformer blocks
+    for l in range(cfg.n_layers):
+        lp = f"{p}layers.{l}."
+        is_global = cfg.attn_types is not None and cfg.attn_types[l] == "global"
+        d_head_l = cfg.d_head_global if (is_global and hasattr(cfg, "d_head_global") and cfg.d_head_global) else cfg.d_head
+        is_shared_kv = cfg.kv_shared_layer_sources is not None and l in cfg.kv_shared_layer_sources
+
+        # Layer norms (pre- and post-sublayer)
+        state_dict[f"blocks.{l}.ln1.w"] = rms(f"{lp}input_layernorm.weight")
+        state_dict[f"blocks.{l}.ln1_post.w"] = rms(f"{lp}post_attention_layernorm.weight")
+        state_dict[f"blocks.{l}.ln2.w"] = rms(f"{lp}pre_feedforward_layernorm.weight")
+        state_dict[f"blocks.{l}.ln2_post.w"] = rms(f"{lp}post_feedforward_layernorm.weight")
+
+        # Q projection (present on every layer)
+        w = get(f"{lp}self_attn.q_proj.weight")
+        W_Q = einops.rearrange(w, "(n h) m -> n m h", n=cfg.n_heads)
+        state_dict[f"blocks.{l}.attn.W_Q"] = W_Q.to(dtype)
+        state_dict[f"blocks.{l}.attn.b_Q"] = torch.zeros(cfg.n_heads, d_head_l, dtype=dtype)
+        del w, W_Q
+
+        # O projection (present on every layer)
+        w = get(f"{lp}self_attn.o_proj.weight")
+        W_O = einops.rearrange(w, "m (n h) -> n h m", n=cfg.n_heads)
+        state_dict[f"blocks.{l}.attn.W_O"] = W_O.to(dtype)
+        state_dict[f"blocks.{l}.attn.b_O"] = torch.zeros(cfg.d_model, dtype=dtype)
+        del w, W_O
+
+        # K/V projections — absent for shared-KV borrower layers (15–34)
+        if not is_shared_kv:
+            w = get(f"{lp}self_attn.k_proj.weight")
+            W_K = einops.rearrange(w, "(n h) m -> n m h", n=cfg.n_key_value_heads)
+            state_dict[f"blocks.{l}.attn._W_K"] = W_K.to(dtype)
+            state_dict[f"blocks.{l}.attn._b_K"] = torch.zeros(cfg.n_key_value_heads, d_head_l, dtype=dtype)
+            del w, W_K
+
+            w = get(f"{lp}self_attn.v_proj.weight")
+            W_V = einops.rearrange(w, "(n h) m -> n m h", n=cfg.n_key_value_heads)
+            state_dict[f"blocks.{l}.attn._W_V"] = W_V.to(dtype)
+            state_dict[f"blocks.{l}.attn._b_V"] = torch.zeros(cfg.n_key_value_heads, d_head_l, dtype=dtype)
+            del w, W_V
+
+        # QKV norms: q_norm on all layers; k_norm/v_norm absent on shared-KV layers.
+        # v_norm weight exists only if Gemma4RMSNorm was created with with_scale=True.
+        if cfg.use_qk_norm:
+            state_dict[f"blocks.{l}.attn.q_norm.w"] = rms(f"{lp}self_attn.q_norm.weight")
+            kn = rms_opt(f"{lp}self_attn.k_norm.weight")
+            if kn is not None:
+                state_dict[f"blocks.{l}.attn.k_norm.w"] = kn
+            vn = rms_opt(f"{lp}self_attn.v_norm.weight")
+            if vn is not None:
+                state_dict[f"blocks.{l}.attn.v_norm.w"] = vn
+
+        # MLP (gated)
+        w = get(f"{lp}mlp.up_proj.weight")
+        state_dict[f"blocks.{l}.mlp.W_in"] = w.T.to(dtype)
+        del w
+
+        w = get(f"{lp}mlp.gate_proj.weight")
+        state_dict[f"blocks.{l}.mlp.W_gate"] = w.T.to(dtype)
+        del w
+
+        w = get(f"{lp}mlp.down_proj.weight")
+        state_dict[f"blocks.{l}.mlp.W_out"] = w.T.to(dtype)
+        del w
+
+        state_dict[f"blocks.{l}.mlp.b_in"] = torch.zeros(cfg.d_mlp, dtype=dtype)
+        state_dict[f"blocks.{l}.mlp.b_out"] = torch.zeros(cfg.d_model, dtype=dtype)
+
+        # PLE per-block weights
+        if cfg.use_ple:
+            w = get(f"{lp}per_layer_input_gate.weight")
+            state_dict[f"blocks.{l}.ple_gate.W"] = w.T.to(dtype)
+            del w
+
+            w = get(f"{lp}per_layer_projection.weight")
+            state_dict[f"blocks.{l}.ple_up.W"] = w.T.to(dtype)
+            del w
+
+            state_dict[f"blocks.{l}.ple_ln.w"] = rms(f"{lp}post_per_layer_input_norm.weight")
+
+            # layer_scalar is a buffer (shape [1]) — squeeze to 0-dim to match TL param shape
+            ls = get_opt(f"{lp}layer_scalar")
+            if ls is not None:
+                state_dict[f"blocks.{l}.layer_scale"] = ls.squeeze().to(dtype)
+
+    state_dict["ln_final.w"] = rms(f"{p}norm.weight")
+
+    # Unembed: Gemma 4 ties word embeddings; lm_head is on the outer wrapper
+    if lm_head_key is not None:
+        w = get(lm_head_key)
+        state_dict["unembed.W_U"] = w.T.to(dtype)
+        del w
+    else:
+        w = get(f"{p}embed_tokens.weight")
+        state_dict["unembed.W_U"] = w.T.to(dtype)
+        del w
+    state_dict["unembed.b_U"] = torch.zeros(cfg.d_vocab, dtype=dtype)
 
     return state_dict
