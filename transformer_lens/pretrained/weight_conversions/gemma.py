@@ -247,7 +247,7 @@ def convert_gemma4_weights(gemma, cfg: HookedTransformerConfig):
         if cfg.use_qk_norm:
             state_dict[f"blocks.{l}.attn.q_norm.w"] = _rms_weight(layer.self_attn.q_norm)
             state_dict[f"blocks.{l}.attn.k_norm.w"] = _rms_weight(layer.self_attn.k_norm)
-            if hasattr(layer.self_attn, "v_norm"):
+            if hasattr(layer.self_attn, "v_norm") and len(list(layer.self_attn.v_norm.parameters())) > 0:
                 state_dict[f"blocks.{l}.attn.v_norm.w"] = _rms_weight(layer.self_attn.v_norm)
 
         # MLP weights
