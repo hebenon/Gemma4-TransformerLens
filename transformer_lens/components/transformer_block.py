@@ -97,7 +97,13 @@ class TransformerBlock(nn.Module):
             attn_type = self.cfg.attn_types[block_index]
             self.attn = attention(self.cfg, attn_type, block_index)
         if not self.cfg.attn_only:
-            self.mlp = MLPFactory.create_mlp(self.cfg)
+            # Per-layer MLP widths (e.g. Gemma 4: layers 15-34 have d_mlp=12288 vs 6144)
+            if getattr(self.cfg, "d_mlp_by_layer", None) is not None and block_index < len(self.cfg.d_mlp_by_layer):
+                import dataclasses
+                _mlp_cfg = dataclasses.replace(self.cfg, d_mlp=self.cfg.d_mlp_by_layer[block_index])
+            else:
+                _mlp_cfg = self.cfg
+            self.mlp = MLPFactory.create_mlp(_mlp_cfg)
 
         self.hook_attn_in = HookPoint()  # [batch, pos, n_heads, d_model]
         self.hook_q_input = HookPoint()  # [batch, pos, n_heads, d_model]

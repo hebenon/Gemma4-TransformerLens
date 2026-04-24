@@ -1417,6 +1417,9 @@ def convert_hf_model_config(model_name: str, **kwargs: Any) -> dict[str, Any]:
             "use_ple": True,                    # Per-Layer Embeddings
             "d_ple": 256,
             "ple_vocab_size": 262144,
+            # Heterogeneous MLP: layers 0-14 have d_mlp=6144, layers 15-34 have d_mlp=12288.
+            # Confirmed from actual safetensors weight shapes (2026-04-24).
+            "d_mlp_by_layer": [6144] * 15 + [12288] * 20,
             "tokenizer_name": "google/gemma-4-E2B-it",
         }
     elif official_model_name.startswith("google/gemma-2b"):

@@ -315,6 +315,8 @@ class HookedTransformerConfig(TransformerLensConfig):
     use_ple: bool = False
     d_ple: Optional[int] = None
     ple_vocab_size: Optional[int] = None
+    # Gemma 4: heterogeneous MLP widths (layers 0-14: 6144, layers 15-34: 12288)
+    d_mlp_by_layer: Optional[List[int]] = None
 
     def __post_init__(self):
         # Call parent's post_init first
