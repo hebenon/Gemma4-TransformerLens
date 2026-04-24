@@ -132,7 +132,9 @@ class AbstractAttention(ABC, nn.Module):
         self.attn_type = attn_type
         # Create a max_ctx x max_ctx mask, with True iff that query position
         # can attend to that key position (query is first axis, key is second axis)
-        causal_mask = torch.tril(torch.ones((self.cfg.n_ctx, self.cfg.n_ctx)).bool())
+        # Use dtype=torch.bool directly — torch.ones(...).bool() creates a float32
+        # intermediate (n_ctx² × 4 B) before converting; at n_ctx=131072 that's 68 GB.
+        causal_mask = torch.ones((self.cfg.n_ctx, self.cfg.n_ctx), dtype=torch.bool).tril()
         if self.attn_type == "global":
             # For global attention, this is a lower triangular matrix - key <= query
             self.register_buffer("mask", causal_mask)
