@@ -122,7 +122,7 @@ class TransformerBlock(nn.Module):
         if getattr(self.cfg, "use_ple", False):
             assert self.cfg.d_ple is not None
             self.hook_ple_input = HookPoint()   # [batch, pos, d_ple] — PLE conditioning vector
-            self.hook_ple_gate = HookPoint()    # [batch, pos, d_ple] — gate activations post-GELU
+            self.hook_ple_gate = HookPoint()    # [batch, pos, d_ple] — gate activations (linear projection)
             self.hook_ple_output = HookPoint()  # [batch, pos, d_model] — bottleneck output pre-residual
             self.ple_gate = _PLELinear(self.cfg.d_model, self.cfg.d_ple, self.cfg.dtype)
             self.ple_up = _PLELinear(self.cfg.d_ple, self.cfg.d_model, self.cfg.dtype)
@@ -289,13 +289,11 @@ class TransformerBlock(nn.Module):
     ) -> Float[torch.Tensor, "batch pos d_model"]:
         """Apply PLE gated bottleneck and layer_scale to residual stream.
 
-        Gate projects residual to d_ple, element-wise multiply with ple_vec (token+context
-        conditioning), project back to d_model via ple_up, add normed result to residual,
-        then scale by layer_scale.
+        Mirrors Gemma4DecoderLayer: gate is a plain linear (no activation), layer_scale
+        multiplies only the PLE output before adding to the residual — NOT the full residual.
         """
         ple_vec = self.hook_ple_input(ple_vec)
-        gate = self.hook_ple_gate(F.gelu(self.ple_gate(resid)))   # [B, L, d_ple]
+        gate = self.hook_ple_gate(self.ple_gate(resid))          # [B, L, d_ple] — linear, no GELU
         ple_out = self.hook_ple_output(self.ple_up(gate * ple_vec))  # [B, L, d_model]
-        resid = resid + self.ple_ln(ple_out)
-        resid = resid * self.layer_scale
+        resid = resid + self.layer_scale * self.ple_ln(ple_out)  # scale PLE output, not residual
         return resid
