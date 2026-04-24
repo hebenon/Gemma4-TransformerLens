@@ -25,14 +25,24 @@ class TransformerLensKeyValueCacheEntry:
         cfg: TransformerLensConfig,
         device: Union[torch.device, str, None],
         batch_size: int = 1,
+        block_index: int = 0,
     ):
         n_heads = cfg.n_key_value_heads if cfg.n_key_value_heads is not None else cfg.n_heads
+        attn_types = getattr(cfg, "attn_types", None)
+        d_head_global = getattr(cfg, "d_head_global", None)
+        is_global = (
+            d_head_global is not None
+            and attn_types is not None
+            and block_index < len(attn_types)
+            and attn_types[block_index] == "global"
+        )
+        d_head = d_head_global if is_global else cfg.d_head
         return cls(
             past_keys=torch.empty(
-                (batch_size, 0, n_heads, cfg.d_head), device=device, dtype=torch.get_default_dtype()
+                (batch_size, 0, n_heads, d_head), device=device, dtype=cfg.dtype
             ),
             past_values=torch.empty(
-                (batch_size, 0, n_heads, cfg.d_head), device=device, dtype=torch.get_default_dtype()
+                (batch_size, 0, n_heads, d_head), device=device, dtype=cfg.dtype
             ),
         )
 

@@ -59,6 +59,7 @@ class TransformerLensKeyValueCache:
                     cfg,
                     device_for_layer(i),
                     batch_size,
+                    block_index=i,
                 )
                 for i in range(cfg.n_layers)
             ],
