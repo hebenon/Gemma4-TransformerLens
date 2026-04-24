@@ -243,6 +243,11 @@ class TransformerBlock(nn.Module):
             resid_combined = resid_mid + mlp_out
             if getattr(self.cfg, "use_ple", False) and ple_vec is not None:
                 resid_combined = self._apply_ple(resid_combined, ple_vec)
+            # Gemma 4: layer_scalar scales the full block output (all residual connections
+            # included), not just the PLE contribution. Confirmed from HF modeling_gemma4.py:
+            # `hidden_states *= self.layer_scalar` is the last op before returning.
+            if getattr(self.cfg, "use_ple", False) and hasattr(self, "layer_scale"):
+                resid_combined = resid_combined * self.layer_scale
             resid_post = self.hook_resid_post(resid_combined)  # [batch, pos, d_model]
         elif self.cfg.parallel_attn_mlp:
             # Dumb thing done by GPT-J, both MLP and Attn read from resid_pre and write to resid_post, no resid_mid used.
@@ -287,13 +292,13 @@ class TransformerBlock(nn.Module):
         resid: Float[torch.Tensor, "batch pos d_model"],
         ple_vec: Float[torch.Tensor, "batch pos d_ple"],
     ) -> Float[torch.Tensor, "batch pos d_model"]:
-        """Apply PLE gated bottleneck and layer_scale to residual stream.
+        """Apply PLE gated bottleneck to residual stream.
 
-        Mirrors Gemma4DecoderLayer: gate is a plain linear (no activation), layer_scale
-        multiplies only the PLE output before adding to the residual — NOT the full residual.
+        Mirrors Gemma4DecoderLayer: gate has GELU activation (gelu_pytorch_tanh).
+        layer_scale is NOT applied here — it scales the full block output in forward().
         """
         ple_vec = self.hook_ple_input(ple_vec)
-        gate = self.hook_ple_gate(self.ple_gate(resid))          # [B, L, d_ple] — linear, no GELU
+        gate = self.hook_ple_gate(F.gelu(self.ple_gate(resid), approximate="tanh"))  # [B, L, d_ple]
         ple_out = self.hook_ple_output(self.ple_up(gate * ple_vec))  # [B, L, d_model]
-        resid = resid + self.layer_scale * self.ple_ln(ple_out)  # scale PLE output, not residual
+        resid = resid + self.ple_ln(ple_out)
         return resid
