@@ -503,7 +503,8 @@ def convert_gemma4_weights_from_disk(
         state_dict[f"blocks.{l}.mlp.W_out"] = w.T.to(dtype)
         del w
 
-        state_dict[f"blocks.{l}.mlp.b_in"] = torch.zeros(cfg.d_mlp, dtype=dtype)
+        d_mlp_l = cfg.d_mlp_by_layer[l] if getattr(cfg, "d_mlp_by_layer", None) is not None else cfg.d_mlp
+        state_dict[f"blocks.{l}.mlp.b_in"] = torch.zeros(d_mlp_l, dtype=dtype)
         state_dict[f"blocks.{l}.mlp.b_out"] = torch.zeros(cfg.d_model, dtype=dtype)
 
         # PLE per-block weights
