@@ -1391,7 +1391,7 @@ def convert_hf_model_config(model_name: str, **kwargs: Any) -> dict[str, Any]:
             "positional_embedding_type": "rotary",
             "rotary_base": 1000000,       # Global (full) attention layers
             "rotary_base_local": 10000,   # Local (sliding) attention layers
-            "use_attn_scale": True,
+            "use_attn_scale": False,  # HF Gemma4TextAttention uses scaling=1.0 (QK norm makes 1/sqrt(d_head) unnecessary)
             "n_key_value_heads": 1,
             "gated_mlp": True,
             "final_rms": True,
