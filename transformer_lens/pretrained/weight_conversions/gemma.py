@@ -148,11 +148,11 @@ def convert_gemma_weights(gemma, cfg: HookedTransformerConfig):
 
 
 def _rms_weight(norm_or_tensor) -> torch.Tensor:
-    """Extract weight from a Gemma4RMSNorm (or tensor) and pre-add 1.
+    """Extract weight from a Gemma4RMSNorm module or tensor.
 
-    Gemma4RMSNorm adds 1 in forward() — bake that into the stored weight so TL
-    can use a plain multiply. Accepts either a raw tensor or a norm module,
-    auto-discovering the weight parameter name (varies across transformers versions).
+    Gemma4RMSNorm multiplies by weight directly (initialized to ones, not zeros).
+    Unlike Gemma 1/2/3 which use (1 + weight) with zero init, Gemma 4 stores the
+    effective scale directly in the weight — so we load it as-is, no +1.
     """
     if isinstance(norm_or_tensor, torch.Tensor):
         w = norm_or_tensor
@@ -168,7 +168,7 @@ def _rms_weight(norm_or_tensor) -> torch.Tensor:
                 f"No weight param found on {type(norm_or_tensor).__name__} "
                 f"(tried weight/w/scale; actual params: {params})"
             )
-    return w.float() + torch.ones_like(w, dtype=torch.float32)
+    return w.float()
 
 
 def convert_gemma4_weights(gemma, cfg: HookedTransformerConfig):
@@ -404,16 +404,14 @@ def convert_gemma4_weights_from_disk(
         return _open(weight_map[name]).get_tensor(name)
 
     def rms(name: str) -> torch.Tensor:
-        """Load norm weight and pre-add 1 (Gemma4RMSNorm bakes +1 at forward time)."""
-        w = get(name).float()
-        return w + torch.ones_like(w)
+        """Load norm weight as-is (Gemma4RMSNorm multiplies by weight directly; no +1)."""
+        return get(name).float()
 
     def rms_opt(name: str) -> Optional[torch.Tensor]:
         w = get_opt(name)
         if w is None:
             return None
-        w = w.float()
-        return w + torch.ones_like(w)
+        return w.float()
 
     p = prefix  # e.g. "model.language_model.model." or "language_model.model."
     state_dict: dict = {}
