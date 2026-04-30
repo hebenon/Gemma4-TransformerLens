@@ -330,6 +330,125 @@ def _st_discover_lm_head(weight_map: dict, base_prefix: str) -> Optional[str]:
     return None
 
 
+def _convert_moe_layer_from_disk(
+    l: int,
+    lp: str,
+    get,
+    get_opt,
+    rms,
+    rms_opt,
+    cfg,
+    dtype,
+    state_dict: dict,
+) -> None:
+    """Convert one Gemma 4 26B_A4B dual-branch MoE layer from safetensors to TL format.
+
+    Maps HF checkpoint key names → Gemma4DualBranchFFN parameter names.
+
+    *** HF KEY NAMES ARE PLACEHOLDERS — UPDATE FROM TASK 1 (Kaggle enumeration) ***
+
+    Expected HF structure (based on JAX _modules.py _setup_moe() naming):
+      Dense branch (mlp2):
+        {lp}mlp.shared_expert.gate_proj.weight    [H_dense, D]  → dense_mlp.W_gate [D, H_dense]
+        {lp}mlp.shared_expert.up_proj.weight      [H_dense, D]  → dense_mlp.W_in   [D, H_dense]
+        {lp}mlp.shared_expert.down_proj.weight    [D, H_dense]  → dense_mlp.W_out  [H_dense, D]
+      Dense norms:
+        {lp}mlp.pre_feedforward_layernorm_2.weight [D]  → ln_dense_pre.scale
+        {lp}mlp.post_feedforward_layernorm_2.weight [D] → ln_dense_post.scale
+      MoE norms:
+        {lp}mlp.pre_feedforward_layernorm.weight  [D]   → ln_moe_pre.scale
+        {lp}mlp.post_feedforward_layernorm.weight [D]   → ln_moe_post.scale
+      Combined post-norm:
+        {lp}post_feedforward_layernorm.weight     [D]   → ln_combined.scale
+        (or {lp}mlp.post_feedforward_layernorm.weight — confirm in Task 1)
+      Router:
+        {lp}mlp.router.weight   [E, D]  → router_W [D, E]
+        {lp}mlp.router_scale    [D]     → router_scale
+      Expert weights (batched):
+        {lp}mlp.experts.gate_proj.weight  [E, H_expert, D] or [E, 2*H_expert, D] fused
+        {lp}mlp.experts.up_proj.weight    [E, H_expert, D]  (if split)
+        {lp}mlp.experts.down_proj.weight  [E, D, H_expert]
+      Per-expert scale:
+        {lp}mlp.expert_scale    [E]     → per_expert_scale
+    """
+    D = cfg.d_model
+    H_expert = cfg.moe_expert_dim
+    E = cfg.num_experts
+
+    # ── Dense shared branch (mlp2) ────────────────────────────────────────────
+    # Norms: UPDATE KEY NAMES FROM TASK 1
+    state_dict[f"blocks.{l}.mlp.ln_dense_pre.scale"] = rms(
+        f"{lp}mlp.pre_feedforward_layernorm_2.weight"   # PLACEHOLDER
+    ).to(dtype)
+    state_dict[f"blocks.{l}.mlp.ln_dense_post.scale"] = rms(
+        f"{lp}mlp.post_feedforward_layernorm_2.weight"  # PLACEHOLDER
+    ).to(dtype)
+
+    # Dense MLP weights: HF stores [out, in]; TL _GatedMLP stores [in, out] → transpose
+    w = get(f"{lp}mlp.shared_expert.gate_proj.weight")   # PLACEHOLDER [H_dense, D]
+    state_dict[f"blocks.{l}.mlp.dense_mlp.W_gate"] = w.T.to(dtype)
+    del w
+    w = get(f"{lp}mlp.shared_expert.up_proj.weight")     # PLACEHOLDER [H_dense, D]
+    state_dict[f"blocks.{l}.mlp.dense_mlp.W_in"] = w.T.to(dtype)
+    del w
+    w = get(f"{lp}mlp.shared_expert.down_proj.weight")   # PLACEHOLDER [D, H_dense]
+    state_dict[f"blocks.{l}.mlp.dense_mlp.W_out"] = w.T.to(dtype)
+    del w
+
+    # ── MoE branch ────────────────────────────────────────────────────────────
+    # Norms: UPDATE KEY NAMES FROM TASK 1
+    state_dict[f"blocks.{l}.mlp.ln_moe_pre.scale"] = rms(
+        f"{lp}mlp.pre_feedforward_layernorm.weight"     # PLACEHOLDER
+    ).to(dtype)
+    state_dict[f"blocks.{l}.mlp.ln_moe_post.scale"] = rms(
+        f"{lp}mlp.post_feedforward_layernorm.weight"    # PLACEHOLDER
+    ).to(dtype)
+
+    # Combined post-norm: UPDATE KEY NAME FROM TASK 1
+    state_dict[f"blocks.{l}.mlp.ln_combined.scale"] = rms(
+        f"{lp}post_feedforward_layernorm.weight"        # PLACEHOLDER — may be on layer, not mlp
+    ).to(dtype)
+
+    # Router: UPDATE KEY NAMES FROM TASK 1
+    # router_W: HF likely [E, D] (like linear layer) → we want [D, E]; transpose
+    w = get(f"{lp}mlp.router.weight")                   # PLACEHOLDER [E, D]
+    state_dict[f"blocks.{l}.mlp.router_W"] = w.T.to(dtype)  # → [D, E]
+    del w
+    # router_scale: [D] — stored as-is (no transpose)
+    state_dict[f"blocks.{l}.mlp.router_scale"] = get(f"{lp}mlp.router_scale").to(dtype)  # PLACEHOLDER
+
+    # Expert weights: UPDATE KEY NAMES AND SHAPE ORIENTATION FROM TASK 1
+    # gate_proj may be fused [E, 2*H, D] or split [E, H, D].
+    # We need expert_W_gateup: [E, D, 2*H] (TL convention: weights are [in, out]).
+    w_gate = get(f"{lp}mlp.experts.gate_proj.weight")   # PLACEHOLDER [E, H, D] or [E, 2H, D]
+    w_up = get_opt(f"{lp}mlp.experts.up_proj.weight")   # PLACEHOLDER [E, H, D] (if split)
+    if w_up is not None:
+        # Split gate/up: concatenate then transpose last two dims → [E, D, 2H]
+        w_gateup = torch.cat([w_gate, w_up], dim=1)     # [E, 2H, D]
+        state_dict[f"blocks.{l}.mlp.expert_W_gateup"] = w_gateup.transpose(-1, -2).to(dtype)
+        del w_gateup
+    else:
+        # Already fused [E, 2H, D]: transpose → [E, D, 2H]
+        state_dict[f"blocks.{l}.mlp.expert_W_gateup"] = w_gate.transpose(-1, -2).to(dtype)
+    del w_gate
+    if w_up is not None:
+        del w_up
+
+    # Down projection: [E, D, H] or [E, H, D] — we need [E, H, D]
+    # Confirm orientation from Task 1; adjust transpose if needed.
+    w_down = get(f"{lp}mlp.experts.down_proj.weight")   # PLACEHOLDER
+    if w_down.shape[-1] == D:                            # [E, H, D] — already correct
+        state_dict[f"blocks.{l}.mlp.expert_W_down"] = w_down.to(dtype)
+    else:                                                # [E, D, H] — transpose
+        state_dict[f"blocks.{l}.mlp.expert_W_down"] = w_down.transpose(-1, -2).to(dtype)
+    del w_down
+
+    # Per-expert scale: [E] — stored as-is
+    state_dict[f"blocks.{l}.mlp.per_expert_scale"] = get(
+        f"{lp}mlp.expert_scale"                         # PLACEHOLDER
+    ).to(dtype)
+
+
 def convert_gemma4_weights_from_disk(
     model_dir: str,
     cfg: HookedTransformerConfig,
@@ -443,11 +562,18 @@ def convert_gemma4_weights_from_disk(
         d_head_l = cfg.d_head_global if (is_global and hasattr(cfg, "d_head_global") and cfg.d_head_global) else cfg.d_head
         is_shared_kv = cfg.kv_shared_layer_sources is not None and l in cfg.kv_shared_layer_sources
 
-        # Layer norms (pre- and post-sublayer)
+        # Detect dual-branch MoE model (26B_A4B): norms are inside Gemma4DualBranchFFN
+        is_moe = bool(getattr(cfg, "moe_expert_dim", None))
+
+        # Attention sub-layer norms (present on all variants)
         state_dict[f"blocks.{l}.ln1.w"] = rms(f"{lp}input_layernorm.weight")
         state_dict[f"blocks.{l}.ln1_post.w"] = rms(f"{lp}post_attention_layernorm.weight")
-        state_dict[f"blocks.{l}.ln2.w"] = rms(f"{lp}pre_feedforward_layernorm.weight")
-        state_dict[f"blocks.{l}.ln2_post.w"] = rms(f"{lp}post_feedforward_layernorm.weight")
+
+        # FFN sub-layer norms: dense models (E2B) have shared pre/post norms on the block;
+        # MoE models (26B) keep each norm inside Gemma4DualBranchFFN — skip here.
+        if not is_moe:
+            state_dict[f"blocks.{l}.ln2.w"] = rms(f"{lp}pre_feedforward_layernorm.weight")
+            state_dict[f"blocks.{l}.ln2_post.w"] = rms(f"{lp}post_feedforward_layernorm.weight")
 
         # Q projection (present on every layer)
         w = get(f"{lp}self_attn.q_proj.weight")
@@ -488,22 +614,28 @@ def convert_gemma4_weights_from_disk(
             if vn is not None:
                 state_dict[f"blocks.{l}.attn.v_norm.w"] = vn
 
-        # MLP (gated)
-        w = get(f"{lp}mlp.up_proj.weight")
-        state_dict[f"blocks.{l}.mlp.W_in"] = w.T.to(dtype)
-        del w
+        # MLP
+        if is_moe:
+            # Dual-branch MoE (26B_A4B): delegate to helper which maps all MoE-specific keys.
+            # Key names are placeholders — update from Task 1 Kaggle enumeration.
+            _convert_moe_layer_from_disk(l, lp, get, get_opt, rms, rms_opt, cfg, dtype, state_dict)
+        else:
+            # Dense gated MLP (E2B path)
+            w = get(f"{lp}mlp.up_proj.weight")
+            state_dict[f"blocks.{l}.mlp.W_in"] = w.T.to(dtype)
+            del w
 
-        w = get(f"{lp}mlp.gate_proj.weight")
-        state_dict[f"blocks.{l}.mlp.W_gate"] = w.T.to(dtype)
-        del w
+            w = get(f"{lp}mlp.gate_proj.weight")
+            state_dict[f"blocks.{l}.mlp.W_gate"] = w.T.to(dtype)
+            del w
 
-        w = get(f"{lp}mlp.down_proj.weight")
-        state_dict[f"blocks.{l}.mlp.W_out"] = w.T.to(dtype)
-        del w
+            w = get(f"{lp}mlp.down_proj.weight")
+            state_dict[f"blocks.{l}.mlp.W_out"] = w.T.to(dtype)
+            del w
 
-        d_mlp_l = cfg.d_mlp_by_layer[l] if getattr(cfg, "d_mlp_by_layer", None) is not None else cfg.d_mlp
-        state_dict[f"blocks.{l}.mlp.b_in"] = torch.zeros(d_mlp_l, dtype=dtype)
-        state_dict[f"blocks.{l}.mlp.b_out"] = torch.zeros(cfg.d_model, dtype=dtype)
+            d_mlp_l = cfg.d_mlp_by_layer[l] if getattr(cfg, "d_mlp_by_layer", None) is not None else cfg.d_mlp
+            state_dict[f"blocks.{l}.mlp.b_in"] = torch.zeros(d_mlp_l, dtype=dtype)
+            state_dict[f"blocks.{l}.mlp.b_out"] = torch.zeros(cfg.d_model, dtype=dtype)
 
         # PLE per-block weights
         if cfg.use_ple:
