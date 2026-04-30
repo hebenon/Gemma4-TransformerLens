@@ -23,6 +23,7 @@ from .bert_pooler import BertPooler
 from .embed import Embed
 from .grouped_query_attention import GroupedQueryAttention
 from .mlps.gated_mlp import GatedMLP
+from .mlps.gemma4_moe import Gemma4DualBranchFFN
 from .mlps.mlp import MLP
 from .ple_precomputer import PLEPrecomputer
 
