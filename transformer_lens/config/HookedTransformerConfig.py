@@ -317,6 +317,9 @@ class HookedTransformerConfig(TransformerLensConfig):
     ple_vocab_size: Optional[int] = None
     # Gemma 4: heterogeneous MLP widths (layers 0-14: 6144, layers 15-34: 12288)
     d_mlp_by_layer: Optional[List[int]] = None
+    # Gemma 4 26B_A4B: dual-branch MoE FFN
+    moe_expert_dim: Optional[int] = None        # Expert hidden dim (704 for 26B)
+    moe_dense_hidden_dim: Optional[int] = None  # Dense shared-MLP hidden dim (2112 for 26B)
 
     def __post_init__(self):
         # Call parent's post_init first

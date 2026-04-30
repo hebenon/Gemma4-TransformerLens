@@ -1373,6 +1373,57 @@ def convert_hf_model_config(model_name: str, **kwargs: Any) -> dict[str, Any]:
                 "local",
             ],
         }
+    elif official_model_name.startswith("google/gemma-4-26B_A4B"):
+        # Gemma 4 26B_A4B Mixture-of-Experts
+        # Architecture: 30 layers, d_model=2816, 5:1 sliding:global, NO PLE, NO KV sharing.
+        # ALL 30 layers: dual-branch FFN (dense hidden=2112 + MoE: 128 experts, dim=704, top-8).
+        # Confirmed from google-deepmind/gemma JAX repo 2026-04-30.
+        # HF safetensors key names: TBD — run Task 1 (Kaggle enumeration) to finalize weight
+        # conversion in convert_gemma4_weights_from_disk().
+        cfg_dict = {
+            "d_model": 2816,
+            "d_head": 256,              # Local attention head dim
+            "d_head_global": 512,       # Global attention head dim (k_eq_v_global=True)
+            "n_heads": 16,
+            "d_mlp": 2112,              # Dense branch hidden dim (mlp2 in JAX)
+            "n_layers": 30,
+            "n_ctx": 131072,
+            "eps": 1e-06,
+            "d_vocab": 262144,
+            "act_fn": "gelu_pytorch_tanh",
+            "normalization_type": "RMS",
+            "positional_embedding_type": "rotary",
+            "rotary_base": 1_000_000,       # Global attention layers
+            "rotary_base_local": 10_000,    # Local (sliding) attention layers
+            "partial_rotary_factor_global": 0.25,
+            "use_attn_scale": False,        # QK norm replaces 1/sqrt(d_head)
+            "n_key_value_heads": 8,         # Local KV heads
+            "gated_mlp": True,
+            "final_rms": True,
+            "use_normalization_before_and_after": False,  # MoE handles all norms internally
+            "use_qk_norm": True,
+            "window_size": 1024,
+            "use_local_attn": True,
+            "attn_types": [
+                # 5:1 sliding:global, 30 layers = 5 repetitions of [local×5, global×1]
+                "local", "local", "local", "local", "local", "global",  # 0-5
+                "local", "local", "local", "local", "local", "global",  # 6-11
+                "local", "local", "local", "local", "local", "global",  # 12-17
+                "local", "local", "local", "local", "local", "global",  # 18-23
+                "local", "local", "local", "local", "local", "global",  # 24-29
+            ],
+            "output_logits_soft_cap": 30.0,
+            # MoE configuration
+            "num_experts": 128,
+            "experts_per_token": 8,
+            "moe_expert_dim": 704,
+            "moe_dense_hidden_dim": 2112,
+            # No PLE, no KV sharing (simpler than E2B in these dimensions)
+            "use_ple": False,
+            "num_kv_shared_layers": 0,
+            "tokenizer_name": "google/gemma-4-26B_A4B-it",
+            "original_architecture": "Gemma4ForConditionalGeneration",
+        }
     elif official_model_name.startswith("google/gemma-4-E2B"):
         # Gemma 4 E2B (2.3B effective / 5.1B total with embeddings)
         # Architecture confirmed from config.json enumeration 2026-04-22

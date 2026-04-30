@@ -298,3 +298,65 @@ class TestGemma4PLE:
 
     def test_ple_vocab_size(self, e2b_cfg):
         assert e2b_cfg.ple_vocab_size == 262144
+
+
+# ============================================================================
+# Test: Gemma 4 26B_A4B MoE config
+# ============================================================================
+
+
+class TestGemma4_26B_A4B_Config:
+    """26B_A4B MoE config: no PLE, no KV sharing, all layers dual-branch MoE."""
+
+    @pytest.fixture(scope="class")
+    def cfg(self):
+        return get_pretrained_model_config("google/gemma-4-26B_A4B-it", fold_ln=False)
+
+    def test_registered(self):
+        assert "google/gemma-4-26B_A4B-it" in OFFICIAL_MODEL_NAMES
+
+    def test_d_model(self, cfg):
+        assert cfg.d_model == 2816
+
+    def test_n_heads(self, cfg):
+        assert cfg.n_heads == 16
+
+    def test_n_layers(self, cfg):
+        assert cfg.n_layers == 30
+
+    def test_d_head_local(self, cfg):
+        assert cfg.d_head == 256
+
+    def test_d_head_global(self, cfg):
+        assert cfg.d_head_global == 512
+
+    def test_no_ple(self, cfg):
+        assert cfg.use_ple is False
+
+    def test_no_kv_sharing(self, cfg):
+        assert cfg.num_kv_shared_layers == 0
+
+    def test_num_experts(self, cfg):
+        assert cfg.num_experts == 128
+
+    def test_experts_per_token(self, cfg):
+        assert cfg.experts_per_token == 8
+
+    def test_moe_expert_dim(self, cfg):
+        assert cfg.moe_expert_dim == 704
+
+    def test_moe_dense_hidden_dim(self, cfg):
+        assert cfg.moe_dense_hidden_dim == 2112
+
+    def test_attn_pattern_5to1(self, cfg):
+        """5 local : 1 global per group, 5 groups = 30 layers."""
+        global_indices = [i for i, t in enumerate(cfg.attn_types) if t == "global"]
+        assert global_indices == [5, 11, 17, 23, 29]
+
+    def test_window_size(self, cfg):
+        assert cfg.window_size == 1024
+
+    def test_moe_fields_on_htconfig(self, cfg):
+        """moe_expert_dim / moe_dense_hidden_dim come from HookedTransformerConfig."""
+        assert hasattr(cfg, "moe_expert_dim")
+        assert hasattr(cfg, "moe_dense_hidden_dim")
