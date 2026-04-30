@@ -237,6 +237,10 @@ class TransformerBlock(nn.Module):
             if self.cfg.original_architecture in ("Olmo2ForCausalLM", "Olmo3ForCausalLM"):
                 mlp_out = self.apply_mlp(mlp_in)
                 mlp_out = self.ln2(mlp_out)
+            elif getattr(self.mlp, "dual_branch_moe", False):
+                # Gemma 4 26B_A4B: dual-branch MoE handles all pre/post norms internally.
+                # Pass the raw residual (mlp_in) — do NOT apply self.ln2 first.
+                mlp_out = self.hook_mlp_out(self.mlp(mlp_in))
             else:
                 normalized_resid_mid = self.ln2(mlp_in)
                 mlp_out = self.apply_mlp(normalized_resid_mid)
